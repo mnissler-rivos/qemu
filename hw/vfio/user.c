@@ -48,7 +48,7 @@
 static IOThread *vfio_user_iothread;
 
 static void vfio_user_shutdown(VFIOUserProxy *proxy);
-static int vfio_user_send_qio(VFIOUserProxy *proxy, VFIOUserMsg *msg);
+static int vfio_user_send_qio(VFIOUserProxy *proxy, QIOChannel *ioc, VFIOUserMsg *msg);
 static VFIOUserMsg *vfio_user_getmsg(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
                                      VFIOUserFDs *fds);
 static VFIOUserFDs *vfio_user_getfds(int numfds);
@@ -90,9 +90,14 @@ static void vfio_user_shutdown(VFIOUserProxy *proxy)
 {
     qio_channel_shutdown(proxy->ioc, QIO_CHANNEL_SHUTDOWN_READ, NULL);
     qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx, NULL, NULL, NULL);
+    if (proxy->cmd_ioc != NULL) {
+        qio_channel_shutdown(proxy->cmd_ioc, QIO_CHANNEL_SHUTDOWN_READ, NULL);
+        qio_channel_set_aio_fd_handler(proxy->cmd_ioc, proxy->ctx, NULL, NULL,
+                                       NULL);
+    }
 }
 
-static int vfio_user_send_qio(VFIOUserProxy *proxy, VFIOUserMsg *msg)
+static int vfio_user_send_qio(VFIOUserProxy *proxy, QIOChannel *ioc, VFIOUserMsg *msg)
 {
     VFIOUserFDs *fds =  msg->fds;
     struct iovec iov = {
@@ -108,7 +113,7 @@ static int vfio_user_send_qio(VFIOUserProxy *proxy, VFIOUserMsg *msg)
         fdp = fds->fds;
     }
 
-    ret = qio_channel_writev_full(proxy->ioc, &iov, 1, fdp, numfds, 0,
+    ret = qio_channel_writev_full(ioc, &iov, 1, fdp, numfds, 0,
                                   &local_err);
 
     if (ret == -1) {
@@ -253,6 +258,172 @@ static int vfio_user_complete(VFIOUserProxy *proxy, Error **errp)
 
     /* return positive value */
     return 1;
+}
+
+static int vfio_user_recv_one_cmd(VFIOUserProxy *proxy)
+{
+    VFIOUserMsg *msg = NULL;
+    g_autofree int *fdp = NULL;
+    VFIOUserFDs *reqfds;
+    VFIOUserHdr hdr;
+    struct iovec iov = {
+        .iov_base = &hdr,
+        .iov_len = sizeof(hdr),
+    };
+    bool isreply = false;
+    int i, ret;
+    size_t msgleft, numfds = 0;
+    char *data = NULL;
+    char *buf = NULL;
+    Error *local_err = NULL;
+
+    /*
+     * Read header
+     */
+    qio_channel_set_blocking(proxy->cmd_ioc, false, NULL);
+    ret = qio_channel_readv_full(proxy->cmd_ioc, &iov, 1, NULL, NULL, 0,
+                                 &local_err);
+    qio_channel_set_blocking(proxy->cmd_ioc, true, NULL);
+    if (ret == QIO_CHANNEL_ERR_BLOCK) {
+        return ret;
+    }
+
+    /* read error or other side closed connection */
+    if (ret <= 0) {
+        goto fatal;
+    }
+
+    if (ret < sizeof(msg)) {
+        error_setg(&local_err, "short read of header");
+        goto fatal;
+    }
+
+    /*
+     * Validate header
+     */
+    if (hdr.size < sizeof(VFIOUserHdr)) {
+        error_setg(&local_err, "bad header size");
+        goto fatal;
+    }
+    switch (hdr.flags & VFIO_USER_TYPE) {
+    case VFIO_USER_REQUEST:
+        isreply = false;
+        break;
+    case VFIO_USER_REPLY:
+        isreply = true;
+        break;
+    default:
+        error_setg(&local_err, "unknown message type");
+        goto fatal;
+    }
+    trace_vfio_user_recv_hdr(proxy->sockname, hdr.id, hdr.command, hdr.size,
+                             hdr.flags);
+
+    /*
+     * For replies, find the matching pending request.
+     * For requests, reap incoming FDs.
+     */
+    if (isreply) {
+        error_setg(&local_err, "unexpected reply on cmd channel");
+        goto err;
+    } else {
+        if (numfds != 0) {
+            reqfds = vfio_user_getfds(numfds);
+            memcpy(reqfds->fds, fdp, numfds * sizeof(int));
+        } else {
+            reqfds = NULL;
+        }
+    }
+
+    /*
+     * Put the whole message into a single buffer.
+     */
+    if (isreply) {
+        if (hdr.size > msg->rsize) {
+            error_setg(&local_err, "reply larger than recv buffer");
+            goto err;
+        }
+        *msg->hdr = hdr;
+        data = (char *)msg->hdr + sizeof(hdr);
+    } else {
+        if (hdr.size > proxy->max_xfer_size + sizeof(VFIOUserDMARW)) {
+            error_setg(&local_err, "vfio_user_recv request larger than max");
+            goto err;
+        }
+        buf = g_malloc0(hdr.size);
+        memcpy(buf, &hdr, sizeof(hdr));
+        data = buf + sizeof(hdr);
+        msg = vfio_user_getmsg(proxy, (VFIOUserHdr *)buf, reqfds);
+        msg->type = VFIO_MSG_REQ;
+    }
+
+    /*
+     * Read rest of message.
+     */
+    msgleft = hdr.size - sizeof(hdr);
+    while (msgleft > 0) {
+        ret = qio_channel_read(proxy->cmd_ioc, data, msgleft, &local_err);
+
+#if 0
+        /* prepare to complete read on next iternation */
+        if (ret == QIO_CHANNEL_ERR_BLOCK) {
+            proxy->part_recv = msg;
+            proxy->recv_left = msgleft;
+            return ret;
+        }
+#endif
+
+        if (ret <= 0) {
+            goto fatal;
+        }
+        trace_vfio_user_recv_read(hdr.id, ret);
+
+        msgleft -= ret;
+        data += ret;
+    }
+
+    vfio_user_process(proxy, msg, isreply);
+    return 0;
+
+    /*
+     * fatal means the other side closed or we don't trust the stream
+     * err means this message is corrupt
+     */
+fatal:
+    vfio_user_shutdown(proxy);
+    proxy->state = VFIO_PROXY_ERROR;
+
+    /* set error if server side closed */
+    if (ret == 0) {
+        error_setg(&local_err, "server closed socket");
+    }
+
+err:
+    for (i = 0; i < numfds; i++) {
+        close(fdp[i]);
+    }
+    if (isreply && msg != NULL) {
+        /* force an error to keep sending thread from hanging */
+        vfio_user_set_error(msg->hdr, EINVAL);
+        msg->complete = true;
+        qemu_cond_signal(&msg->cv);
+    }
+    error_prepend(&local_err, "vfio_user_recv_one: ");
+    error_report_err(local_err);
+    return -1;
+}
+
+static void vfio_user_recv_cmd(void *opaque)
+{
+    VFIOUserProxy *proxy = opaque;
+
+    QEMU_LOCK_GUARD(&proxy->lock);
+
+    if (proxy->state == VFIO_PROXY_CONNECTED) {
+        while (vfio_user_recv_one_cmd(proxy) == 0) {
+            ;
+        }
+    }
 }
 
 static void vfio_user_recv(void *opaque)
@@ -497,7 +668,7 @@ static int vfio_user_send_one(VFIOUserProxy *proxy)
     int ret;
 
     msg = QTAILQ_FIRST(&proxy->outgoing);
-    ret = vfio_user_send_qio(proxy, msg);
+    ret = vfio_user_send_qio(proxy, proxy->ioc, msg);
     if (ret < 0) {
         return ret;
     }
@@ -632,7 +803,7 @@ static int vfio_user_send_queued(VFIOUserProxy *proxy, VFIOUserMsg *msg)
     if (proxy->flags & VFIO_PROXY_FORCE_QUEUED) {
         ret = QIO_CHANNEL_ERR_BLOCK;
     } else {
-        ret = vfio_user_send_qio(proxy, msg);
+        ret = vfio_user_send_qio(proxy, proxy->ioc, msg);
     }
     if (ret == QIO_CHANNEL_ERR_BLOCK) {
         QTAILQ_INSERT_HEAD(&proxy->outgoing, msg, next);
@@ -684,6 +855,27 @@ static void vfio_user_send_async(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
     if (ret < 0) {
         vfio_user_recycle(proxy, msg);
     }
+}
+
+static void vfio_user_send_cmd_reply(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
+                                 VFIOUserFDs *fds)
+{
+    VFIOUserMsg *msg;
+
+    if (!(hdr->flags & (VFIO_USER_NO_REPLY | VFIO_USER_REPLY))) {
+        error_printf("vfio_user_send_async on sync message\n");
+        return;
+    }
+
+    QEMU_LOCK_GUARD(&proxy->lock);
+
+    msg = vfio_user_getmsg(proxy, hdr, fds);
+    msg->id = hdr->id;
+    msg->rsize = 0;
+    msg->type = VFIO_MSG_ASYNC;
+
+    vfio_user_send_qio(proxy, proxy->cmd_ioc, msg);
+    vfio_user_recycle(proxy, msg);
 }
 
 /*
@@ -843,7 +1035,11 @@ void vfio_user_send_reply(VFIOUserProxy *proxy, VFIOUserHdr *hdr, int size)
     hdr->flags = VFIO_USER_REPLY;
     hdr->size = size;
 
-    vfio_user_send_async(proxy, hdr, NULL);
+    if (proxy->cmd_ioc != NULL) {
+      vfio_user_send_cmd_reply(proxy, hdr, NULL);
+    } else {
+      vfio_user_send_async(proxy, hdr, NULL);
+    }
 }
 
 /*
@@ -860,7 +1056,11 @@ void vfio_user_send_error(VFIOUserProxy *proxy, VFIOUserHdr *hdr, int error)
     hdr->error_reply = error;
     hdr->size = sizeof(*hdr);
 
-    vfio_user_send_async(proxy, hdr, NULL);
+    if (proxy->cmd_ioc != NULL) {
+      vfio_user_send_cmd_reply(proxy, hdr, NULL);
+    } else {
+      vfio_user_send_async(proxy, hdr, NULL);
+    }
 }
 
 /*
@@ -944,8 +1144,12 @@ void vfio_user_set_handler(VFIODevice *vbasedev,
 
     proxy->request = handler;
     proxy->req_arg = req_arg;
-    qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx,
-                                   vfio_user_recv, NULL, proxy);
+    qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx, vfio_user_recv, NULL,
+                                   proxy);
+    if (proxy->cmd_ioc != NULL) {
+        qio_channel_set_aio_fd_handler(proxy->cmd_ioc, proxy->ctx,
+                                       vfio_user_recv_cmd, NULL, proxy);
+    }
 }
 
 void vfio_user_disconnect(VFIOUserProxy *proxy)
@@ -963,6 +1167,10 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
     }
     object_unref(OBJECT(proxy->ioc));
     proxy->ioc = NULL;
+    if (proxy->cmd_ioc != NULL) {
+      object_unref(OBJECT(proxy->cmd_ioc));
+      proxy->cmd_ioc = NULL;
+    }
     qemu_bh_delete(proxy->req_bh);
     proxy->req_bh = NULL;
 
@@ -1411,6 +1619,7 @@ static GString *caps_json(void)
     QDict *dict = qdict_new();
     QDict *capdict = qdict_new();
     QDict *migdict = qdict_new();
+    QDict *twin_socket_dict = qdict_new();
     GString *str;
 
     qdict_put_int(migdict, VFIO_USER_CAP_PGSIZE, VFIO_USER_DEF_PGSIZE);
@@ -1422,6 +1631,9 @@ static GString *caps_json(void)
     qdict_put_int(capdict, VFIO_USER_CAP_PGSIZES, VFIO_USER_DEF_PGSIZE);
     qdict_put_int(capdict, VFIO_USER_CAP_MAP_MAX, VFIO_USER_DEF_MAP_MAX);
     qdict_put_bool(capdict, VFIO_USER_CAP_MULTI, true);
+
+    qdict_put_bool(twin_socket_dict, VFIO_USER_CAP_SUPPORTED, true);
+    qdict_put_obj(capdict, VFIO_USER_CAP_TWIN_SOCKET, QOBJECT(twin_socket_dict));
 
     qdict_put_obj(dict, VFIO_USER_CAP, QOBJECT(capdict));
 
@@ -1436,6 +1648,8 @@ int vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp)
     GString *caps;
     char *reply;
     int size, caplen;
+    int cmd_fd = -1;
+    VFIOUserFDs fds = { 0, 1, &cmd_fd };
 
     caps = caps_json();
     caplen = caps->len + 1;
@@ -1449,7 +1663,7 @@ int vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp)
     g_string_free(caps, true);
     trace_vfio_user_version(msgp->major, msgp->minor, msgp->capabilities);
 
-    vfio_user_send_wait(proxy, &msgp->hdr, NULL, 0, false);
+    vfio_user_send_wait(proxy, &msgp->hdr, &fds, 0, false);
     if (msgp->hdr.flags & VFIO_USER_ERROR) {
         error_setg_errno(errp, msgp->hdr.error_reply, "version reply");
         return -1;
@@ -1469,6 +1683,18 @@ int vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp)
 
     if (caps_check(proxy, msgp->minor, reply, errp) != 0) {
         return -1;
+    }
+
+    if (fds.recv_fds == 1 && cmd_fd >= 0) {
+        proxy->cmd_ioc = QIO_CHANNEL(qio_channel_socket_new_fd(cmd_fd, errp));
+        if (proxy->cmd_ioc == NULL) {
+            return -1;
+        }
+
+        if (proxy->request != NULL) {
+            qio_channel_set_aio_fd_handler(proxy->cmd_ioc, proxy->ctx,
+                                           vfio_user_recv_cmd, NULL, proxy);
+        }
     }
 
     trace_vfio_user_version(msgp->major, msgp->minor, msgp->capabilities);
@@ -2018,6 +2244,7 @@ static int vfio_user_io_dma_map(VFIOContainer *container, MemoryRegion *mr,
         map->vaddr = qemu_ram_block_host_offset(mr->ram_block, addr);
     } else {
         map->vaddr = 0;
+        fd = -1;
     }
 
     return vfio_user_dma_map(proxy, map, fd, proxy->async_ops);

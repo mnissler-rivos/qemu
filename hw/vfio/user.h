@@ -53,6 +53,7 @@ typedef struct VFIOUserProxy {
     QLIST_ENTRY(VFIOUserProxy) next;
     char *sockname;
     struct QIOChannel *ioc;
+    struct QIOChannel *cmd_ioc;
     void (*request)(void *opaque, VFIOUserMsg *msg);
     void *req_arg;
     uint64_t max_xfer_size;

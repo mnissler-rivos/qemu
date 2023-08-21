@@ -123,9 +123,10 @@ static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
     size = msg->count + sizeof(VFIOUserDMARW);
     res = g_malloc0(size);
     memcpy(res, msg, sizeof(*res));
+    res->hdr.size = size;
     g_free(msg);
 
-    r = pci_dma_read(pdev, res->offset, &res->data, res->count);
+    r = pci_dma_read(pdev, res->offset, res->data, res->count);
 
     switch (r) {
     case MEMTX_OK:
@@ -166,12 +167,12 @@ static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
         return;
     }
 
-    r = pci_dma_write(pdev, msg->offset, &msg->data, msg->count);
+    r = pci_dma_write(pdev, msg->offset, msg->data, msg->count);
 
     switch (r) {
     case MEMTX_OK:
         if ((msg->hdr.flags & VFIO_USER_NO_REPLY) == 0) {
-            vfio_user_send_reply(proxy, &msg->hdr, sizeof(msg->hdr));
+            vfio_user_send_reply(proxy, &msg->hdr, sizeof(*msg));
         } else {
             g_free(msg);
         }

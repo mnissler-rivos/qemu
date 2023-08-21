@@ -75,6 +75,9 @@ typedef struct {
 #define VFIO_USER_CAP_MAP_MAX   "max_dma_maps"
 #define VFIO_USER_CAP_MIGR      "migration"
 #define VFIO_USER_CAP_MULTI     "write_multiple"
+#define VFIO_USER_CAP_TWIN_SOCKET  "twin_socket"
+#define VFIO_USER_CAP_SUPPORTED  "supported"
+#define VFIO_USER_CAP_ENABLE  "enable"
 
 /* "migration" members */
 #define VFIO_USER_CAP_PGSIZE            "pgsize"
@@ -210,7 +213,7 @@ typedef struct {
 typedef struct {
     VFIOUserHdr hdr;
     uint64_t offset;
-    uint32_t count;
+    uint64_t count;
     char data[];
 } VFIOUserDMARW;
 
