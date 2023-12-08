@@ -95,8 +95,11 @@ static bool msix_vector_masked(PCIDevice *dev, unsigned int vector, bool fmask)
     if (xen_enabled() && xen_is_pirq_msi(pci_get_long(data))) {
         return false;
     }
+    /*
     return fmask || dev->msix_table[offset + PCI_MSIX_ENTRY_VECTOR_CTRL] &
         PCI_MSIX_ENTRY_CTRL_MASKBIT;
+        */
+    return fmask;
 }
 
 bool msix_is_masked(PCIDevice *dev, unsigned int vector)
